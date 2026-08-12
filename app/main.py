@@ -33,6 +33,20 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
+
+# --- Render health check ---
+# Render's health check hits GET /healthz specifically (not /health, which is
+# also kept below for any existing monitors already pointing at it). This
+# handler is intentionally trivial: no DB session, no external API calls, no
+# auth — so it returns 200 even if Postgres, Twelve Data, or Firebase are
+# temporarily unreachable. It's also exempt from the SlowAPI rate limiter so
+# frequent health-check polling can never itself cause a failed check.
+@app.get("/healthz", tags=["health"])
+@limiter.exempt
+def healthz(request: Request):
+    return {"status": "ok"}
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
