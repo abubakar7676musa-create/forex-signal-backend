@@ -15,10 +15,11 @@ from app.services.twelve_data import (
 )
 from app.services.news_calendar import (
     get_economic_events,
-    is_pair_in_news_blackout,
+    is_news_blackout,
 )
 from app.services.fcm import broadcast_new_signal
 from app.ai_engine.signal_generator import generate_signal
+
 
 scheduler = AsyncIOScheduler()
 
@@ -30,9 +31,11 @@ async def analyze_pair(
     db = SessionLocal()
 
     try:
-        # Check already-fetched news events.
-        # This does NOT make another API request.
-        blackout = is_pair_in_news_blackout(
+        # IMPORTANT:
+        # No API request here.
+        # Economic calendar was already fetched once
+        # for the whole cycle.
+        blackout = is_news_blackout(
             pair,
             news_events,
         )
@@ -117,9 +120,9 @@ async def analyze_pair(
             "Skipping this pair for this cycle."
         )
 
-    except Exception as e:
+    except Exception as exc:
         logger.exception(
-            f"[{pair}] Signal analysis failed: {e}"
+            f"[{pair}] Signal analysis failed: {exc}"
         )
 
     finally:
@@ -132,20 +135,44 @@ async def analyze_all_pairs():
         f"{len(SUPPORTED_PAIRS)} pairs..."
     )
 
-    # Fetch the economic calendar ONCE per cycle.
-    # Previously this was called once for every pair.
+    # ---------------------------------------------------------
+    # FETCH NEWS ONCE
+    # ---------------------------------------------------------
     news_events = await get_economic_events()
 
-    for index, pair in enumerate(SUPPORTED_PAIRS):
-        await analyze_pair(
-            pair,
-            news_events,
+    logger.info(
+        f"Economic calendar loaded with "
+        f"{len(news_events)} events."
+    )
+
+    # ---------------------------------------------------------
+    # ANALYZE PAIRS
+    # ---------------------------------------------------------
+    for index, pair in enumerate(SUPPORTED_PAIRS, start=1):
+
+        logger.info(
+            f"Analyzing pair "
+            f"{index}/{len(SUPPORTED_PAIRS)}: {pair}"
         )
 
-        # Give Twelve Data time between requests.
-        # This helps prevent request bursts on lower-tier plans.
-        if index < len(SUPPORTED_PAIRS) - 1:
-            await asyncio.sleep(10)
+        try:
+            await analyze_pair(
+                pair,
+                news_events,
+            )
+
+        except TwelveDataRateLimitError:
+            logger.warning(
+                f"[{pair}] Rate limit reached. "
+                "Stopping remaining pairs for this cycle."
+            )
+            break
+
+        # Small spacing between requests.
+        #
+        # The TwelveData client itself is responsible for
+        # the actual credit limiter.
+        await asyncio.sleep(1.5)
 
     logger.info(
         "Signal analysis cycle complete."
