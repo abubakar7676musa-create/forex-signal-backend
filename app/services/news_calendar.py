@@ -1,14 +1,14 @@
 """
 Economic news blackout handling.
 
-The economic calendar is fetched once per analysis cycle instead of
-once for every currency pair. This significantly reduces API traffic.
+The economic calendar is fetched ONCE per analysis cycle,
+then reused for every pair.
 
-If the calendar is unavailable, the system fails OPEN so that a
-third-party calendar outage does not stop signal generation.
+This prevents unnecessary Twelve Data API calls.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
+from typing import Any
 
 from loguru import logger
 
@@ -35,100 +35,133 @@ PAIR_CURRENCIES = {
 BLACKOUT_WINDOW_MINUTES = 30
 
 
-async def get_economic_events() -> list[dict]:
+async def get_economic_events() -> list[dict[str, Any]]:
     """
-    Fetch the economic calendar once.
+    Fetch economic calendar once.
 
-    Returns an empty list if the endpoint is unavailable.
+    Failure is fail-open because news data must never stop
+    the entire signal engine.
     """
+
     try:
         data = await twelve_data_client._get(
             "economic_calendar",
-            {"country": ""},
+            {
+                "country": "",
+            },
         )
 
-        events = data.get("data", [])
+        events = (
+            data.get("data", [])
+            if isinstance(data, dict)
+            else []
+        )
 
         if not isinstance(events, list):
+            logger.warning(
+                "Economic calendar returned unexpected format."
+            )
             return []
 
-        logger.info(
-            f"Economic calendar loaded: {len(events)} events"
+        logger.debug(
+            f"Economic calendar loaded: "
+            f"{len(events)} events."
         )
 
         return events
 
     except TwelveDataRateLimitError:
         logger.warning(
-            "Economic calendar rate-limited by Twelve Data; "
-            "continuing without blackout data."
+            "Economic calendar skipped because "
+            "Twelve Data quota is exhausted."
         )
         return []
 
     except Exception as exc:
         logger.warning(
-            f"Economic calendar unavailable, failing open: {exc}"
+            "Economic calendar unavailable, "
+            f"failing open: {exc}"
         )
         return []
 
 
-def is_pair_in_news_blackout(
+def is_news_blackout(
     pair: str,
-    events: list[dict],
+    events: list[dict[str, Any]],
 ) -> bool:
     """
-    Check a pair against already-fetched calendar events.
+    Check whether a pair is inside the blackout window.
 
-    No API request is made here.
+    IMPORTANT:
+    This function performs NO API request.
     """
-    now = datetime.now(timezone.utc)
+
+    now = datetime.utcnow()
+
     relevant_currencies = PAIR_CURRENCIES.get(
         pair,
         set(),
     )
 
+    if not relevant_currencies:
+        return False
+
     for event in events:
         try:
-            if str(event.get("impact", "")).lower() != "high":
+            impact = str(
+                event.get("impact", "")
+            ).lower()
+
+            if impact != "high":
                 continue
 
-            if event.get("currency") not in relevant_currencies:
+            currency = event.get("currency")
+
+            if currency not in relevant_currencies:
                 continue
 
-            raw_date = event["date"]
+            date_value = event.get("date")
+
+            if not date_value:
+                continue
+
             event_time = datetime.fromisoformat(
-                raw_date.replace("Z", "+00:00")
+                str(date_value).replace(
+                    "Z",
+                    "+00:00",
+                )
             )
 
-            if event_time.tzinfo is None:
-                event_time = event_time.replace(
-                    tzinfo=timezone.utc
+            # Normalize timezone-aware values to naive UTC.
+            if event_time.tzinfo is not None:
+                from datetime import timezone
+
+                event_time = (
+                    event_time
+                    .astimezone(timezone.utc)
+                    .replace(tzinfo=None)
                 )
 
-            difference = abs(
+            difference_seconds = abs(
                 (event_time - now).total_seconds()
             )
 
-            if difference <= BLACKOUT_WINDOW_MINUTES * 60:
+            if (
+                difference_seconds
+                <= BLACKOUT_WINDOW_MINUTES * 60
+            ):
+                logger.info(
+                    f"[{pair}] High-impact news blackout: "
+                    f"{currency} event at {event_time}"
+                )
+
                 return True
 
-        except (KeyError, ValueError, TypeError):
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
             continue
 
     return False
-
-
-async def is_news_blackout(
-    pair: str,
-    events: list[dict] | None = None,
-) -> bool:
-    """
-    Backward-compatible helper.
-
-    If events are supplied, no API request is made.
-    If not supplied, it fetches the calendar once.
-    """
-    if events is None:
-        events = await get_economic_events()
-
-    return is_pair_in_news_blackout(pair, events)
