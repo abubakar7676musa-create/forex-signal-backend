@@ -1,4 +1,3 @@
-
 """
 Secure Twelve Data API client.
 
@@ -6,8 +5,8 @@ Goals:
 - Never expose the API key to the Flutter app.
 - Prevent HTTP 429 retry storms.
 - Respect Twelve Data minute-based API credit limits.
-- Dynamically learn the real quota from response headers.
-- Keep existing public methods compatible.
+- Read API credit information from response headers.
+- Keep the existing public methods compatible with the app.
 """
 
 import asyncio
@@ -29,151 +28,149 @@ SYMBOL_MAP = {
 
 
 class TwelveDataRateLimitError(Exception):
-    """Raised when Twelve Data quota is exhausted."""
+    """Raised when Twelve Data rejects a request because of rate limits."""
 
 
 class TwelveDataClient:
+
     def __init__(self):
-        self.base_url = settings.TWELVE_DATA_BASE_URL.rstrip("/")
-        self.api_key = settings.TWELVE_DATA_API_KEY
-
-        # Your current Free/Basic plan is 8 credits/minute.
-        #
-        # Keep one credit in reserve so the application does not
-        # continuously operate at the provider's absolute limit.
-        self.default_credits_per_minute = 8
-        self.safety_reserve = 1
-
-        self.max_credits_per_minute = (
-            self.default_credits_per_minute
-            - self.safety_reserve
+        self.base_url = (
+            settings.TWELVE_DATA_BASE_URL.rstrip("/")
         )
 
-        # Local rolling credit history.
+        self.api_key = settings.TWELVE_DATA_API_KEY
+
+        # Twelve Data Basic/Free:
+        # 8 API credits per minute.
         #
-        # (monotonic_timestamp, estimated_credits)
-        self._credit_history: deque[tuple[float, int]] = deque()
+        # Reserve one credit as a safety margin.
+        self.max_credits_per_minute = 7
 
-        # Provider-reported state.
+        # Local reservations.
+        # (monotonic timestamp, estimated credits)
+        self._credit_history: deque[
+            tuple[float, int]
+        ] = deque()
+
+        # Provider-reported remaining credits.
         self._provider_credits_left: int | None = None
-        self._provider_credits_used: int | None = None
-        self._provider_limit: int | None = None
 
-        # Prevent concurrent requests from bypassing the limiter.
+        # Protect limiter state.
         self._rate_lock = asyncio.Lock()
 
-        # Reuse one HTTP connection pool instead of creating a client
-        # for every single request.
-        self._client: httpx.AsyncClient | None = None
-
-        # When the provider returns 429, do not hammer it again.
+        # If provider reports quota exhaustion,
+        # block until the next minute.
         self._blocked_until: float = 0.0
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    connect=10,
-                    read=20,
-                    write=10,
-                    pool=10,
-                ),
-                limits=httpx.Limits(
-                    max_connections=5,
-                    max_keepalive_connections=5,
-                ),
-            )
-
-        return self._client
-
-    async def close(self) -> None:
-        """Close the shared HTTP client."""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
 
     def _symbol(self, pair: str) -> str:
         return SYMBOL_MAP.get(pair, pair)
 
+    def _seconds_until_next_minute(self) -> float:
+        """
+        Twelve Data resets minute quota at the start
+        of the next minute.
+
+        Add a small safety margin.
+        """
+
+        now = time.time()
+
+        next_minute = (
+            int(now // 60) + 1
+        ) * 60
+
+        return max(
+            1.0,
+            next_minute - now + 0.5,
+        )
+
     def _cleanup_credit_history(self) -> None:
+        """
+        Remove reservations older than one minute.
+        """
+
         now = time.monotonic()
 
         while self._credit_history:
-            timestamp, _credits = self._credit_history[0]
+
+            timestamp, _credits = (
+                self._credit_history[0]
+            )
 
             if now - timestamp >= 60:
                 self._credit_history.popleft()
             else:
                 break
 
-    def _seconds_until_next_minute(self) -> float:
-        """
-        Twelve Data restores the full API quota at the start of
-        a new minute.
-
-        Use wall-clock time here because the provider's reset is
-        minute based.
-        """
-        now = time.time()
-        seconds = 60 - (now % 60)
-
-        # Small safety buffer for clock/network differences.
-        return max(1.0, seconds + 0.5)
+    def _local_credits_used(self) -> int:
+        return sum(
+            credits
+            for _timestamp, credits
+            in self._credit_history
+        )
 
     async def _wait_for_credit_slot(
         self,
         estimated_credits: int = 1,
     ) -> None:
         """
-        Wait until it is safe to send another API request.
+        Wait until both local and provider-reported
+        credit limits allow a request.
         """
 
         while True:
+
             async with self._rate_lock:
+
                 now = time.monotonic()
 
-                # If a previous 429 blocked the client, wait until
-                # the provider quota should have reset.
+                # ---------------------------------------------
+                # PROVIDER BLOCK
+                # ---------------------------------------------
+
                 if now < self._blocked_until:
+
                     wait_seconds = (
                         self._blocked_until - now
                     )
 
                     logger.warning(
-                        "Twelve Data client temporarily blocked. "
-                        f"Waiting {wait_seconds:.1f}s."
+                        "Twelve Data quota exhausted. "
+                        f"Waiting {wait_seconds:.1f}s "
+                        "for the next quota window."
                     )
+
                 else:
+
                     self._cleanup_credit_history()
 
-                    used_local = sum(
-                        credits
-                        for _timestamp, credits
-                        in self._credit_history
+                    local_used = (
+                        self._local_credits_used()
                     )
 
-                    provider_left = self._provider_credits_left
+                    # -----------------------------------------
+                    # PROVIDER-REPORTED LIMIT
+                    # -----------------------------------------
 
-                    # If Twelve Data explicitly told us that no credits
-                    # remain, wait for the next minute.
-                    if (
-                        provider_left is not None
-                        and provider_left < estimated_credits
-                    ):
-                        wait_seconds = (
-                            self._seconds_until_next_minute()
-                        )
+                    provider_left = (
+                        self._provider_credits_left
+                    )
 
-                        logger.info(
-                            "Twelve Data provider credits exhausted. "
-                            f"left={provider_left}. "
-                            f"Waiting {wait_seconds:.1f}s "
-                            "for quota reset."
-                        )
+                    provider_allows = (
+                        provider_left is None
+                        or provider_left
+                        >= estimated_credits
+                    )
 
-                    elif (
-                        used_local + estimated_credits
+                    local_allows = (
+                        local_used
+                        + estimated_credits
                         <= self.max_credits_per_minute
+                    )
+
+                    if (
+                        local_allows
+                        and provider_allows
                     ):
                         self._credit_history.append(
                             (
@@ -181,145 +178,128 @@ class TwelveDataClient:
                                 estimated_credits,
                             )
                         )
-                        return
 
-                    else:
-                        # Local rolling window is full.
-                        if self._credit_history:
-                            oldest_timestamp, _ = (
-                                self._credit_history[0]
-                            )
-
-                            wait_seconds = max(
-                                1.0,
-                                60
-                                - (
-                                    time.monotonic()
-                                    - oldest_timestamp
-                                )
-                                + 0.5,
-                            )
-                        else:
-                            wait_seconds = (
-                                self._seconds_until_next_minute()
-                            )
-
-                        logger.info(
-                            "Twelve Data local limiter: "
-                            f"{used_local}/"
-                            f"{self.max_credits_per_minute} "
-                            "credits reserved. "
-                            f"Waiting {wait_seconds:.1f}s."
+                        logger.debug(
+                            "Twelve Data credit slot "
+                            f"reserved: "
+                            f"local_used={local_used}, "
+                            f"local_limit="
+                            f"{self.max_credits_per_minute}, "
+                            f"provider_left="
+                            f"{provider_left}"
                         )
 
-            await asyncio.sleep(wait_seconds)
+                        return
+
+                    # -----------------------------------------
+                    # WAIT FOR NEXT MINUTE
+                    # -----------------------------------------
+
+                    wait_seconds = (
+                        self._seconds_until_next_minute()
+                    )
+
+                    logger.info(
+                        "Twelve Data rate limiter waiting. "
+                        f"local_used={local_used}/"
+                        f"{self.max_credits_per_minute}, "
+                        f"provider_left="
+                        f"{provider_left}, "
+                        f"waiting="
+                        f"{wait_seconds:.1f}s"
+                    )
+
+            await asyncio.sleep(
+                min(wait_seconds, 5.0)
+            )
+
+    def _remove_last_reservation(self) -> None:
+        """
+        Remove the most recent local reservation.
+
+        Used when the provider rejected the request.
+        """
+
+        self._cleanup_credit_history()
+
+        if not self._credit_history:
+            return
+
+        timestamp, credits = (
+            self._credit_history[-1]
+        )
+
+        if (
+            time.monotonic() - timestamp < 5
+            and credits == 1
+        ):
+            self._credit_history.pop()
 
     def _sync_credit_headers(
         self,
         response: httpx.Response,
     ) -> None:
         """
-        Synchronize local state with Twelve Data's actual
-        credit headers.
+        Synchronize local state with Twelve Data
+        provider credit headers.
         """
 
-        credits_left_raw = response.headers.get(
+        credits_left = response.headers.get(
             "api-credits-left"
         )
 
-        credits_used_raw = response.headers.get(
+        credits_used = response.headers.get(
             "api-credits-used"
         )
 
-        try:
-            credits_left = (
-                int(credits_left_raw)
-                if credits_left_raw is not None
-                else None
-            )
-        except (TypeError, ValueError):
-            credits_left = None
+        credits_request = response.headers.get(
+            "api-credits-request"
+        )
 
         try:
-            credits_used = (
-                int(credits_used_raw)
-                if credits_used_raw is not None
-                else None
-            )
-        except (TypeError, ValueError):
-            credits_used = None
+            if credits_left is not None:
+                self._provider_credits_left = int(
+                    credits_left
+                )
 
-        if credits_left is not None:
-            self._provider_credits_left = credits_left
-
-        if credits_used is not None:
-            self._provider_credits_used = credits_used
-
-        if (
-            credits_left is not None
-            and credits_used is not None
-        ):
-            self._provider_limit = (
-                credits_left + credits_used
-            )
-
-            # Never exceed the provider's real quota.
-            #
-            # Keep one credit as a safety reserve.
-            self.max_credits_per_minute = max(
-                1,
-                self._provider_limit
-                - self.safety_reserve,
-            )
-
-            logger.debug(
-                "Twelve Data credits: "
-                f"used={credits_used}, "
-                f"left={credits_left}, "
-                f"limit={self._provider_limit}, "
-                f"local_limit={self.max_credits_per_minute}"
-            )
-
-    async def _block_until_reset(self) -> None:
-        async with self._rate_lock:
-            wait_seconds = (
-                self._seconds_until_next_minute()
-            )
-
-            self._blocked_until = (
-                time.monotonic() + wait_seconds
-            )
-
-            # The provider has told us the quota is exhausted.
-            self._provider_credits_left = 0
-
+        except ValueError:
             logger.warning(
-                "Twelve Data quota exhausted. "
-                f"Blocking requests for {wait_seconds:.1f}s "
-                "until the next quota window."
+                f"Invalid api-credits-left header: "
+                f"{credits_left}"
             )
+
+        logger.debug(
+            "Twelve Data credits: "
+            f"used={credits_used}, "
+            f"left={credits_left}, "
+            f"request={credits_request}, "
+            f"local_limit="
+            f"{self.max_credits_per_minute}"
+        )
+
+        # If provider says no credits remain,
+        # proactively block requests until the next minute.
+        try:
+            if (
+                credits_left is not None
+                and int(credits_left) <= 0
+            ):
+                self._blocked_until = (
+                    time.monotonic()
+                    + self._seconds_until_next_minute()
+                )
+
+        except ValueError:
+            pass
 
     async def _get(
         self,
         endpoint: str,
         params: dict[str, Any],
     ) -> dict:
-        """
-        Perform one safe Twelve Data request.
 
-        429:
-            Never immediately retries.
-
-        Network/timeout:
-            Raised to the caller.
-
-        5xx:
-            Raised to the caller.
-
-        API status=error:
-            Converted to ValueError.
-        """
-
+        # Current endpoints used by the application
+        # consume one credit per symbol/request.
         await self._wait_for_credit_slot(1)
 
         request_params = {
@@ -327,98 +307,145 @@ class TwelveDataClient:
             "apikey": self.api_key,
         }
 
-        client = await self._get_client()
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=10,
+                read=20,
+                write=10,
+                pool=10,
+            )
+        ) as client:
 
-        try:
-            response = await client.get(
-                f"{self.base_url}/{endpoint}",
-                params=request_params,
+            try:
+
+                response = await client.get(
+                    f"{self.base_url}/{endpoint}",
+                    params=request_params,
+                )
+
+            except httpx.TimeoutException as exc:
+
+                logger.warning(
+                    f"Twelve Data timeout on "
+                    f"{endpoint}: {exc}"
+                )
+
+                # Timeout does not prove whether the provider
+                # consumed the credit. Keep reservation.
+                raise
+
+            except httpx.NetworkError as exc:
+
+                logger.warning(
+                    f"Twelve Data network error on "
+                    f"{endpoint}: {exc}"
+                )
+
+                # Network failure does not prove whether
+                # provider consumed the request.
+                raise
+
+            self._sync_credit_headers(
+                response
             )
 
-        except httpx.TimeoutException as exc:
-            logger.warning(
-                f"Twelve Data timeout on {endpoint}: {exc}"
-            )
-            raise
+            # -------------------------------------------------
+            # RATE LIMIT
+            # -------------------------------------------------
 
-        except httpx.NetworkError as exc:
-            logger.warning(
-                f"Twelve Data network error on "
-                f"{endpoint}: {exc}"
-            )
-            raise
+            if response.status_code == 429:
 
-        self._sync_credit_headers(response)
+                async with self._rate_lock:
 
-        # ---------------------------------------------------------
-        # RATE LIMIT
-        # ---------------------------------------------------------
-        if response.status_code == 429:
-            logger.warning(
-                "Twelve Data returned HTTP 429 on "
-                f"{endpoint}. "
-                "No immediate retry will be performed."
-            )
+                    self._remove_last_reservation()
 
-            await self._block_until_reset()
+                    self._blocked_until = (
+                        time.monotonic()
+                        + self._seconds_until_next_minute()
+                    )
 
-            raise TwelveDataRateLimitError(
-                "Twelve Data API rate limit reached."
-            )
+                logger.warning(
+                    "Twelve Data returned HTTP 429. "
+                    "No immediate retry will be performed. "
+                    "Requests are blocked until the next "
+                    "quota window."
+                )
 
-        # ---------------------------------------------------------
-        # SERVER ERRORS
-        # ---------------------------------------------------------
-        if 500 <= response.status_code <= 599:
-            logger.warning(
-                "Twelve Data server error "
-                f"{response.status_code} on {endpoint}."
-            )
+                raise TwelveDataRateLimitError(
+                    "Twelve Data API rate limit reached."
+                )
+
+            # -------------------------------------------------
+            # SERVER ERRORS
+            # -------------------------------------------------
+
+            if (
+                500
+                <= response.status_code
+                <= 599
+            ):
+
+                logger.warning(
+                    "Twelve Data server error "
+                    f"{response.status_code} "
+                    f"on {endpoint}."
+                )
+
+                response.raise_for_status()
+
+            # -------------------------------------------------
+            # OTHER HTTP ERRORS
+            # -------------------------------------------------
 
             response.raise_for_status()
 
-        # ---------------------------------------------------------
-        # OTHER HTTP ERRORS
-        # ---------------------------------------------------------
-        response.raise_for_status()
+            # -------------------------------------------------
+            # JSON
+            # -------------------------------------------------
 
-        # ---------------------------------------------------------
-        # JSON
-        # ---------------------------------------------------------
-        try:
-            data = response.json()
+            try:
 
-        except ValueError as exc:
-            logger.error(
-                "Invalid JSON response from Twelve Data "
-                f"endpoint={endpoint}"
-            )
+                data = response.json()
 
-            raise ValueError(
-                "Invalid JSON response from Twelve Data"
-            ) from exc
-
-        # ---------------------------------------------------------
-        # API-LEVEL ERROR
-        # ---------------------------------------------------------
-        if isinstance(data, dict):
-            if data.get("status") == "error":
-                message = data.get(
-                    "message",
-                    "Twelve Data API error",
-                )
+            except ValueError as exc:
 
                 logger.error(
-                    f"Twelve Data API error on "
-                    f"{endpoint}: {message}"
+                    "Invalid JSON response from "
+                    f"Twelve Data endpoint="
+                    f"{endpoint}"
                 )
 
-                raise ValueError(message)
+                raise ValueError(
+                    "Invalid JSON response from Twelve Data"
+                ) from exc
 
-        return data
+            # -------------------------------------------------
+            # API-LEVEL ERROR
+            # -------------------------------------------------
 
-    async def get_quote(self, pair: str) -> dict:
-        """Return latest quote for a pair."""
+            if isinstance(data, dict):
+
+                if data.get("status") == "error":
+
+                    message = data.get(
+                        "message",
+                        "Twelve Data API error",
+                    )
+
+                    logger.error(
+                        f"Twelve Data API error "
+                        f"on {endpoint}: "
+                        f"{message}"
+                    )
+
+                    raise ValueError(message)
+
+            return data
+
+    async def get_quote(
+        self,
+        pair: str,
+    ) -> dict:
 
         return await self._get(
             "quote",
@@ -427,8 +454,10 @@ class TwelveDataClient:
             },
         )
 
-    async def get_price(self, pair: str) -> float:
-        """Return latest price for a pair."""
+    async def get_price(
+        self,
+        pair: str,
+    ) -> float:
 
         data = await self._get(
             "price",
@@ -437,7 +466,9 @@ class TwelveDataClient:
             },
         )
 
-        return float(data["price"])
+        return float(
+            data["price"]
+        )
 
     async def get_time_series(
         self,
@@ -445,11 +476,6 @@ class TwelveDataClient:
         interval: str = "1h",
         outputsize: int = 300,
     ) -> pd.DataFrame:
-        """
-        Return OHLC data ordered oldest -> newest.
-
-        Public signature remains unchanged.
-        """
 
         data = await self._get(
             "time_series",
@@ -460,19 +486,27 @@ class TwelveDataClient:
             },
         )
 
-        values = data.get("values", [])
+        values = data.get(
+            "values",
+            [],
+        )
 
         if not values:
             raise ValueError(
-                f"No time series data returned for {pair}"
+                f"No time series data returned "
+                f"for {pair}"
             )
 
-        df = pd.DataFrame(values)
+        df = pd.DataFrame(
+            values
+        )
 
         if "datetime" not in df.columns:
+
             raise ValueError(
-                f"Twelve Data response for {pair} "
-                "does not contain datetime values."
+                f"Twelve Data response for "
+                f"{pair} does not contain "
+                "datetime values."
             )
 
         df["datetime"] = pd.to_datetime(
@@ -484,18 +518,18 @@ class TwelveDataClient:
             subset=["datetime"]
         )
 
-        required_columns = [
+        for column in [
             "open",
             "high",
             "low",
             "close",
-        ]
+        ]:
 
-        for column in required_columns:
             if column not in df.columns:
+
                 raise ValueError(
-                    f"Missing required column '{column}' "
-                    f"for {pair}"
+                    f"Missing required column "
+                    f"'{column}' for {pair}"
                 )
 
             df[column] = pd.to_numeric(
@@ -504,37 +538,38 @@ class TwelveDataClient:
             )
 
         df = df.dropna(
-            subset=required_columns
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
         )
 
         if "volume" in df.columns:
+
             df["volume"] = pd.to_numeric(
                 df["volume"],
                 errors="coerce",
             ).fillna(0.0)
+
         else:
+
             df["volume"] = 0.0
 
         return (
-            df
-            .sort_values("datetime")
-            .reset_index(drop=True)
+            df.sort_values(
+                "datetime"
+            )
+            .reset_index(
+                drop=True
+            )
         )
 
     async def get_quotes_bulk(
         self,
         pairs: list[str],
     ) -> dict:
-        """
-        Fetch quotes for multiple symbols.
-
-        Note:
-        Credit consumption is based on symbols and endpoint
-        weight according to Twelve Data's credit model.
-        """
-
-        if not pairs:
-            return {}
 
         symbols = ",".join(
             self._symbol(pair)
