@@ -23,6 +23,26 @@ from app.ai_engine.signal_generator import generate_signal
 
 scheduler = AsyncIOScheduler()
 
+# ---------------------------------------------------------
+# TWELVE DATA SAFETY
+# ---------------------------------------------------------
+
+# Your local Twelve Data client intentionally reserves
+# one credit from the provider quota.
+#
+# Example:
+# Provider quota = 8 credits/minute
+# Application limit = 7 credits/minute
+#
+# Therefore we analyze at most 7 pairs per cycle.
+MAX_PAIRS_PER_CYCLE = 7
+
+# Continue from the next pair on the next scheduler cycle.
+_pair_cursor = 0
+
+# Prevent duplicate cycles inside the same process.
+_cycle_lock = asyncio.Lock()
+
 
 async def analyze_pair(
     pair: str,
@@ -58,7 +78,7 @@ async def analyze_pair(
                 f"({result.reject_reason}): "
                 f"{result.explanation}"
             )
-            return
+            return True
 
         signal = Signal(
             pair=result.pair,
@@ -114,72 +134,170 @@ async def analyze_pair(
             f"{result.confidence}% confidence"
         )
 
+        return True
+
     except TwelveDataRateLimitError:
         logger.warning(
             f"[{pair}] Twelve Data rate limit reached. "
-            "Skipping this pair for this cycle."
+            "Stopping this cycle immediately."
         )
+        return False
 
     except Exception as exc:
         logger.exception(
             f"[{pair}] Signal analysis failed: {exc}"
         )
+        return True
 
     finally:
         db.close()
 
 
 async def analyze_all_pairs():
-    logger.info(
-        f"Starting signal analysis cycle for "
-        f"{len(SUPPORTED_PAIRS)} pairs..."
-    )
+    global _pair_cursor
 
     # ---------------------------------------------------------
-    # FETCH NEWS ONCE
+    # PREVENT OVERLAPPING CYCLES
     # ---------------------------------------------------------
-    news_events = await get_economic_events()
 
-    logger.info(
-        f"Economic calendar loaded with "
-        f"{len(news_events)} events."
-    )
+    if _cycle_lock.locked():
+        logger.warning(
+            "Signal analysis cycle already running. "
+            "Skipping duplicate scheduler invocation."
+        )
+        return
 
-    # ---------------------------------------------------------
-    # ANALYZE PAIRS
-    # ---------------------------------------------------------
-    for index, pair in enumerate(SUPPORTED_PAIRS, start=1):
+    async with _cycle_lock:
+
+        total_pairs = len(SUPPORTED_PAIRS)
+
+        if total_pairs == 0:
+            logger.warning(
+                "No supported pairs configured."
+            )
+            return
 
         logger.info(
-            f"Analyzing pair "
-            f"{index}/{len(SUPPORTED_PAIRS)}: {pair}"
+            f"Starting signal analysis cycle: "
+            f"{total_pairs} total pairs, "
+            f"max {MAX_PAIRS_PER_CYCLE} API pairs this cycle."
         )
 
+        # -----------------------------------------------------
+        # FETCH NEWS ONCE
+        # -----------------------------------------------------
+
         try:
-            await analyze_pair(
+            news_events = await get_economic_events()
+
+        except Exception as exc:
+            logger.warning(
+                f"Economic calendar unavailable: {exc}. "
+                "Continuing without news blackout events."
+            )
+            news_events = []
+
+        logger.info(
+            f"Economic calendar loaded with "
+            f"{len(news_events)} events."
+        )
+
+        # -----------------------------------------------------
+        # ROTATING PAIR WINDOW
+        # -----------------------------------------------------
+
+        start_index = _pair_cursor
+
+        selected_pairs = []
+
+        for offset in range(
+            min(MAX_PAIRS_PER_CYCLE, total_pairs)
+        ):
+            index = (
+                start_index + offset
+            ) % total_pairs
+
+            selected_pairs.append(
+                SUPPORTED_PAIRS[index]
+            )
+
+        logger.info(
+            f"Selected pairs this cycle: "
+            f"{selected_pairs}"
+        )
+
+        # -----------------------------------------------------
+        # ANALYZE SELECTED PAIRS
+        # -----------------------------------------------------
+
+        processed = 0
+
+        for index, pair in enumerate(
+            selected_pairs,
+            start=1,
+        ):
+            logger.info(
+                f"Analyzing pair "
+                f"{index}/{len(selected_pairs)}: "
+                f"{pair}"
+            )
+
+            success = await analyze_pair(
                 pair,
                 news_events,
             )
 
-        except TwelveDataRateLimitError:
-            logger.warning(
-                f"[{pair}] Rate limit reached. "
-                "Stopping remaining pairs for this cycle."
-            )
-            break
+            processed += 1
 
-        # Small spacing between requests.
-        #
-        # The TwelveData client itself is responsible for
-        # the actual credit limiter.
-        await asyncio.sleep(1.5)
+            # -------------------------------------------------
+            # STOP IMMEDIATELY ON 429
+            # -------------------------------------------------
 
-    logger.info(
-        "Signal analysis cycle complete."
-    )
+            if not success:
+                logger.warning(
+                    "Twelve Data quota reached. "
+                    "Stopping remaining pairs for this cycle."
+                )
+                break
+
+            # Small spacing between requests.
+            #
+            # The Twelve Data client remains the authoritative
+            # credit limiter.
+            await asyncio.sleep(1.5)
+
+        # -----------------------------------------------------
+        # ADVANCE ROTATING CURSOR
+        # -----------------------------------------------------
+
+        if processed > 0:
+            _pair_cursor = (
+                start_index + processed
+            ) % total_pairs
+
+        logger.info(
+            f"Signal analysis cycle complete. "
+            f"Processed={processed}, "
+            f"next_pair_index={_pair_cursor}"
+        )
 
 
 def start_scheduler():
+    # ---------------------------------------------------------
+    # AVOID DUPLICATE JOBS
+    # ---------------------------------------------------------
+
+    existing_job = scheduler.get_job(
+        "signal_analysis_cycle"
+    )
+
+    if existing_job is not None:
+        logger.warning(
+            "Signal analysis scheduler already exists. "
+            "Skipping duplicate registration."
+        )
+        return
+
     scheduler.add_job(
         analyze_all_pairs,
         "interval",
@@ -188,11 +306,13 @@ def start_scheduler():
         next_run_time=datetime.utcnow(),
         max_instances=1,
         coalesce=True,
+        misfire_grace_time=30,
     )
 
     scheduler.start()
 
     logger.info(
-        "Scheduler started: analyzing all pairs "
+        "Scheduler started: analyzing up to "
+        f"{MAX_PAIRS_PER_CYCLE} pairs per cycle "
         f"every {settings.SIGNAL_POLL_INTERVAL_SECONDS}s"
     )
