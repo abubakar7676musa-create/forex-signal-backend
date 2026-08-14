@@ -1,21 +1,21 @@
 """
 Economic news blackout handling.
 
-The economic calendar is fetched ONCE per analysis cycle,
-then reused for every pair.
+IMPORTANT:
+Twelve Data does not provide the economic-calendar endpoint
+used by the previous implementation.
 
-This prevents unnecessary Twelve Data API calls.
+Therefore this module does NOT make any Twelve Data API request.
+
+The signal engine remains fail-open:
+- If external news events are supplied, blackout logic is used.
+- If no events are available, trading continues normally.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
-
-from app.services.twelve_data import (
-    twelve_data_client,
-    TwelveDataRateLimitError,
-)
 
 
 PAIR_CURRENCIES = {
@@ -37,52 +37,27 @@ BLACKOUT_WINDOW_MINUTES = 30
 
 async def get_economic_events() -> list[dict[str, Any]]:
     """
-    Fetch economic calendar once.
+    Return economic events for the current analysis cycle.
 
-    Failure is fail-open because news data must never stop
-    the entire signal engine.
+    Twelve Data does not provide the macroeconomic calendar endpoint
+    previously used by this application.
+
+    We intentionally return an empty list instead of making an invalid
+    API request that would:
+      1. produce HTTP 404;
+      2. consume a Twelve Data API credit;
+      3. add unnecessary latency to every analysis cycle.
+
+    A separate economic-calendar provider can be connected here later
+    without changing the scheduler or signal engine interface.
     """
 
-    try:
-        data = await twelve_data_client._get(
-            "economic_calendar",
-            {
-                "country": "",
-            },
-        )
+    logger.debug(
+        "Economic calendar provider disabled. "
+        "No Twelve Data economic_calendar request will be made."
+    )
 
-        events = (
-            data.get("data", [])
-            if isinstance(data, dict)
-            else []
-        )
-
-        if not isinstance(events, list):
-            logger.warning(
-                "Economic calendar returned unexpected format."
-            )
-            return []
-
-        logger.debug(
-            f"Economic calendar loaded: "
-            f"{len(events)} events."
-        )
-
-        return events
-
-    except TwelveDataRateLimitError:
-        logger.warning(
-            "Economic calendar skipped because "
-            "Twelve Data quota is exhausted."
-        )
-        return []
-
-    except Exception as exc:
-        logger.warning(
-            "Economic calendar unavailable, "
-            f"failing open: {exc}"
-        )
-        return []
+    return []
 
 
 def is_news_blackout(
@@ -90,13 +65,16 @@ def is_news_blackout(
     events: list[dict[str, Any]],
 ) -> bool:
     """
-    Check whether a pair is inside the blackout window.
+    Check whether a pair is inside the high-impact news blackout window.
 
     IMPORTANT:
     This function performs NO API request.
     """
 
-    now = datetime.utcnow()
+    if not events:
+        return False
+
+    now = datetime.now(timezone.utc)
 
     relevant_currencies = PAIR_CURRENCIES.get(
         pair,
@@ -115,7 +93,9 @@ def is_news_blackout(
             if impact != "high":
                 continue
 
-            currency = event.get("currency")
+            currency = str(
+                event.get("currency", "")
+            ).upper()
 
             if currency not in relevant_currencies:
                 continue
@@ -132,18 +112,20 @@ def is_news_blackout(
                 )
             )
 
-            # Normalize timezone-aware values to naive UTC.
-            if event_time.tzinfo is not None:
-                from datetime import timezone
-
-                event_time = (
-                    event_time
-                    .astimezone(timezone.utc)
-                    .replace(tzinfo=None)
+            # Normalize event time to UTC.
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(
+                    tzinfo=timezone.utc
+                )
+            else:
+                event_time = event_time.astimezone(
+                    timezone.utc
                 )
 
             difference_seconds = abs(
-                (event_time - now).total_seconds()
+                (
+                    event_time - now
+                ).total_seconds()
             )
 
             if (
@@ -152,7 +134,7 @@ def is_news_blackout(
             ):
                 logger.info(
                     f"[{pair}] High-impact news blackout: "
-                    f"{currency} event at {event_time}"
+                    f"{currency} event at {event_time.isoformat()}"
                 )
 
                 return True
