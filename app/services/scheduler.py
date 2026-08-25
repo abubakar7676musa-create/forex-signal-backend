@@ -9,40 +9,55 @@ from app.config import settings, SUPPORTED_PAIRS
 from app.database import SessionLocal
 from app.models.signal import Signal, SignalDirection
 from app.models.notification import Notification
+
+from app.services.market_data import (
+    market_data_client,
+)
+
 from app.services.twelve_data import (
-    twelve_data_client,
     TwelveDataRateLimitError,
 )
+
 from app.services.news_calendar import (
     get_economic_events,
     is_news_blackout,
 )
+
 from app.services.fcm import broadcast_new_signal
 from app.ai_engine.signal_generator import generate_signal
 
 
 scheduler = AsyncIOScheduler()
 
-# ---------------------------------------------------------
-# TWELVE DATA SAFETY
-# ---------------------------------------------------------
 
-# Your local Twelve Data client intentionally reserves
-# one credit from the provider quota.
+# ---------------------------------------------------------
+# MARKET DATA SAFETY
+# ---------------------------------------------------------
 #
-# Example:
-# Provider quota = 8 credits/minute
-# Application limit = 7 credits/minute
+# FCS is now the PRIMARY market-data provider.
 #
-# Therefore we analyze at most 7 pairs per cycle.
-MAX_PAIRS_PER_CYCLE = 7
+# Twelve Data remains available automatically as fallback
+# inside market_data_client.
+#
+# Therefore this value is NOT a Twelve Data credit limit.
+#
+# It only controls how many pairs we process in one cycle
+# to keep the scheduler workload reasonable.
+#
+MAX_PAIRS_PER_CYCLE = 10
+
 
 # Continue from the next pair on the next scheduler cycle.
 _pair_cursor = 0
 
+
 # Prevent duplicate cycles inside the same process.
 _cycle_lock = asyncio.Lock()
 
+
+# =========================================================
+# ANALYZE ONE PAIR
+# =========================================================
 
 async def analyze_pair(
     pair: str,
@@ -51,20 +66,40 @@ async def analyze_pair(
     db = SessionLocal()
 
     try:
-        # IMPORTANT:
-        # No API request here.
-        # Economic calendar was already fetched once
-        # for the whole cycle.
+        # -----------------------------------------------------
+        # NEWS BLACKOUT
+        # -----------------------------------------------------
+        #
+        # Economic calendar has already been fetched once
+        # for the entire cycle.
+        #
         blackout = is_news_blackout(
             pair,
             news_events,
         )
 
-        df = await twelve_data_client.get_time_series(
+        # -----------------------------------------------------
+        # MARKET DATA
+        # -----------------------------------------------------
+        #
+        # PRIMARY:
+        #     FCS
+        #
+        # FALLBACK:
+        #     Twelve Data
+        #
+        # The market_data_client handles provider switching.
+        #
+
+        df = await market_data_client.get_time_series(
             pair,
             interval="1h",
             outputsize=300,
         )
+
+        # -----------------------------------------------------
+        # GENERATE SIGNAL
+        # -----------------------------------------------------
 
         result = generate_signal(
             pair,
@@ -72,13 +107,23 @@ async def analyze_pair(
             is_news_blackout=blackout,
         )
 
+        # -----------------------------------------------------
+        # NO SIGNAL
+        # -----------------------------------------------------
+
         if not result.published:
+
             logger.info(
                 f"[{pair}] No signal published "
                 f"({result.reject_reason}): "
                 f"{result.explanation}"
             )
+
             return True
+
+        # -----------------------------------------------------
+        # CREATE SIGNAL
+        # -----------------------------------------------------
 
         signal = Signal(
             pair=result.pair,
@@ -105,6 +150,10 @@ async def analyze_pair(
         db.commit()
         db.refresh(signal)
 
+        # -----------------------------------------------------
+        # NOTIFICATION
+        # -----------------------------------------------------
+
         notification = Notification(
             title=(
                 f"New {result.direction} Signal: "
@@ -121,6 +170,10 @@ async def analyze_pair(
         db.add(notification)
         db.commit()
 
+        # -----------------------------------------------------
+        # BROADCAST
+        # -----------------------------------------------------
+
         broadcast_new_signal(
             result.pair,
             result.direction,
@@ -136,24 +189,51 @@ async def analyze_pair(
 
         return True
 
+    # ---------------------------------------------------------
+    # TWELVE DATA RATE LIMIT
+    # ---------------------------------------------------------
+    #
+    # This should only happen if:
+    #
+    # FCS failed
+    # AND
+    # Twelve Data fallback was also quota-limited.
+    #
+    # ---------------------------------------------------------
+
     except TwelveDataRateLimitError:
+
         logger.warning(
-            f"[{pair}] Twelve Data rate limit reached. "
+            f"[{pair}] FCS unavailable and "
+            "Twelve Data fallback quota is exhausted. "
             "Stopping this cycle immediately."
         )
+
         return False
 
+    # ---------------------------------------------------------
+    # OTHER ERRORS
+    # ---------------------------------------------------------
+
     except Exception as exc:
+
         logger.exception(
             f"[{pair}] Signal analysis failed: {exc}"
         )
+
         return True
 
     finally:
+
         db.close()
 
 
+# =========================================================
+# ANALYZE ALL PAIRS
+# =========================================================
+
 async def analyze_all_pairs():
+
     global _pair_cursor
 
     # ---------------------------------------------------------
@@ -161,40 +241,51 @@ async def analyze_all_pairs():
     # ---------------------------------------------------------
 
     if _cycle_lock.locked():
+
         logger.warning(
             "Signal analysis cycle already running. "
             "Skipping duplicate scheduler invocation."
         )
+
         return
 
     async with _cycle_lock:
 
-        total_pairs = len(SUPPORTED_PAIRS)
+        total_pairs = len(
+            SUPPORTED_PAIRS
+        )
 
         if total_pairs == 0:
+
             logger.warning(
                 "No supported pairs configured."
             )
+
             return
 
         logger.info(
             f"Starting signal analysis cycle: "
             f"{total_pairs} total pairs, "
-            f"max {MAX_PAIRS_PER_CYCLE} API pairs this cycle."
+            f"max {MAX_PAIRS_PER_CYCLE} pairs this cycle."
         )
 
         # -----------------------------------------------------
-        # FETCH NEWS ONCE
+        # FETCH ECONOMIC NEWS ONCE
         # -----------------------------------------------------
 
         try:
-            news_events = await get_economic_events()
+
+            news_events = (
+                await get_economic_events()
+            )
 
         except Exception as exc:
+
             logger.warning(
                 f"Economic calendar unavailable: {exc}. "
                 "Continuing without news blackout events."
             )
+
             news_events = []
 
         logger.info(
@@ -211,8 +302,12 @@ async def analyze_all_pairs():
         selected_pairs = []
 
         for offset in range(
-            min(MAX_PAIRS_PER_CYCLE, total_pairs)
+            min(
+                MAX_PAIRS_PER_CYCLE,
+                total_pairs,
+            )
         ):
+
             index = (
                 start_index + offset
             ) % total_pairs
@@ -236,6 +331,7 @@ async def analyze_all_pairs():
             selected_pairs,
             start=1,
         ):
+
             logger.info(
                 f"Analyzing pair "
                 f"{index}/{len(selected_pairs)}: "
@@ -250,27 +346,37 @@ async def analyze_all_pairs():
             processed += 1
 
             # -------------------------------------------------
-            # STOP IMMEDIATELY ON 429
+            # STOP ONLY IF BOTH PROVIDERS ARE UNAVAILABLE
             # -------------------------------------------------
 
             if not success:
+
                 logger.warning(
-                    "Twelve Data quota reached. "
-                    "Stopping remaining pairs for this cycle."
+                    "Market-data providers unavailable "
+                    "for this cycle. "
+                    "Stopping remaining pairs."
                 )
+
                 break
 
-            # Small spacing between requests.
+            # -------------------------------------------------
+            # SMALL SPACING
+            # -------------------------------------------------
             #
-            # The Twelve Data client remains the authoritative
-            # credit limiter.
-            await asyncio.sleep(1.5)
+            # This is NOT a Twelve Data waiting mechanism.
+            #
+            # It simply prevents the scheduler from hammering
+            # the provider APIs continuously.
+            #
+
+            await asyncio.sleep(1.0)
 
         # -----------------------------------------------------
         # ADVANCE ROTATING CURSOR
         # -----------------------------------------------------
 
         if processed > 0:
+
             _pair_cursor = (
                 start_index + processed
             ) % total_pairs
@@ -282,7 +388,12 @@ async def analyze_all_pairs():
         )
 
 
+# =========================================================
+# START SCHEDULER
+# =========================================================
+
 def start_scheduler():
+
     # ---------------------------------------------------------
     # AVOID DUPLICATE JOBS
     # ---------------------------------------------------------
@@ -292,11 +403,17 @@ def start_scheduler():
     )
 
     if existing_job is not None:
+
         logger.warning(
             "Signal analysis scheduler already exists. "
             "Skipping duplicate registration."
         )
+
         return
+
+    # ---------------------------------------------------------
+    # REGISTER JOB
+    # ---------------------------------------------------------
 
     scheduler.add_job(
         analyze_all_pairs,
@@ -314,5 +431,6 @@ def start_scheduler():
     logger.info(
         "Scheduler started: analyzing up to "
         f"{MAX_PAIRS_PER_CYCLE} pairs per cycle "
-        f"every {settings.SIGNAL_POLL_INTERVAL_SECONDS}s"
+        f"every "
+        f"{settings.SIGNAL_POLL_INTERVAL_SECONDS}s"
     )
