@@ -1,27 +1,59 @@
 """
-Combines classic technical indicators + candlestick patterns + Smart Money Concepts
-into a single weighted confluence score, then builds a full trade signal
-(entry / SL / TP1 / TP2 / RR / confidence / explanation) only when the setup
-is strong enough to publish.
+Rule-based Forex signal engine.
 
-IMPORTANT: This is a rule-based confluence engine, not a guarantee of profitable
-trades. It rejects low-confluence setups and enforces a minimum risk:reward,
-but market risk can never be eliminated.
+Combines:
+- Classic technical indicators
+- Candlestick patterns
+- Smart Money Concepts (SMC)
+- Fibonacci
+- Support / resistance
+
+The engine publishes a signal only when directional confluence,
+risk/reward and confidence requirements are satisfied.
+
+IMPORTANT:
+This is a rule-based confluence engine, not a guarantee of profitable
+trades. Market risk can never be eliminated.
 """
+
 from dataclasses import dataclass, field
 from typing import Optional
 
 import pandas as pd
 
 from app.config import settings
-from app.ai_engine.indicators import compute_all_indicators, fibonacci_levels, support_resistance
+from app.ai_engine.indicators import (
+    compute_all_indicators,
+    fibonacci_levels,
+    support_resistance,
+)
 from app.ai_engine.patterns import detect_patterns
 from app.ai_engine.smart_money import full_smc_analysis
 
 
-# Points that a pair's price is typically quoted in — used for ATR-based SL padding.
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 JPY_PAIRS = {"USD/JPY", "EUR/JPY", "GBP/JPY"}
 
+MIN_BARS = 210
+
+ATR_SL_MULTIPLIER = 1.5
+STRUCTURE_PADDING_ATR = 0.2
+
+TP1_R_MULTIPLE = 2.0
+TP2_R_MULTIPLE = 3.5
+
+MAX_CONFIDENCE = 97
+MIN_CONFIDENCE_FLOOR = 30
+
+MIN_DIRECTION_SCORE = 5.0
+
+
+# ---------------------------------------------------------------------------
+# Result model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SignalResult:
@@ -39,227 +71,904 @@ class SignalResult:
     reject_reason: Optional[str] = None
 
 
-def _score_technical(df: pd.DataFrame) -> tuple[int, int, list[str]]:
-    """Returns (bullish_points, bearish_points, reasons) from classic indicators."""
-    bull, bear = 0, 0
-    reasons = []
-    last = df.iloc[-1]
-
-    # Trend via EMA stack
-    if last["ema_20"] > last["ema_50"] > last["ema_200"]:
-        bull += 2
-        reasons.append("EMA stack bullish (20>50>200)")
-    elif last["ema_20"] < last["ema_50"] < last["ema_200"]:
-        bear += 2
-        reasons.append("EMA stack bearish (20<50<200)")
-
-    # RSI
-    if last["rsi_14"] < 30:
-        bull += 1
-        reasons.append(f"RSI oversold ({last['rsi_14']:.1f})")
-    elif last["rsi_14"] > 70:
-        bear += 1
-        reasons.append(f"RSI overbought ({last['rsi_14']:.1f})")
-    elif last["rsi_14"] > 50:
-        bull += 0.5
-    elif last["rsi_14"] < 50:
-        bear += 0.5
-
-    # MACD
-    if last["macd"] > last["macd_signal"] and last["macd_hist"] > 0:
-        bull += 1
-        reasons.append("MACD bullish crossover")
-    elif last["macd"] < last["macd_signal"] and last["macd_hist"] < 0:
-        bear += 1
-        reasons.append("MACD bearish crossover")
-
-    # Bollinger Bands (mean reversion / breakout context)
-    if last["close"] <= last["bb_lower"]:
-        bull += 1
-        reasons.append("Price at/below lower Bollinger Band")
-    elif last["close"] >= last["bb_upper"]:
-        bear += 1
-        reasons.append("Price at/above upper Bollinger Band")
-
-    # ADX (trend strength gate, not directional)
-    trending = last["adx_14"] > 20
-    if trending:
-        reasons.append(f"ADX confirms trend strength ({last['adx_14']:.1f})")
-
-    return round(bull), round(bear), reasons if trending else reasons + ["⚠ ADX below 20: weak trend"]
-
-
-def _score_patterns(df: pd.DataFrame) -> tuple[int, int, list[str]]:
-    bull, bear = 0, 0
-    reasons = []
-    patterns = detect_patterns(df)
-    bullish_patterns = {"bullish_engulfing", "hammer"}
-    bearish_patterns = {"bearish_engulfing", "shooting_star"}
-    for p in patterns:
-        if p in bullish_patterns:
-            bull += 1
-            reasons.append(f"Candlestick: {p.replace('_', ' ')}")
-        elif p in bearish_patterns:
-            bear += 1
-            reasons.append(f"Candlestick: {p.replace('_', ' ')}")
-    return bull, bear, reasons
-
-
-def _score_smc(df: pd.DataFrame) -> tuple[int, int, list[str]]:
-    bull, bear = 0, 0
-    reasons = []
-    smc = full_smc_analysis(df)
-
-    if smc["bos"] == "bullish_bos":
-        bull += 2
-        reasons.append("Break of Structure (bullish)")
-    elif smc["bos"] == "bearish_bos":
-        bear += 2
-        reasons.append("Break of Structure (bearish)")
-
-    if smc["choch"] == "bullish_choch":
-        bull += 2
-        reasons.append("Change of Character (bullish reversal)")
-    elif smc["choch"] == "bearish_choch":
-        bear += 2
-        reasons.append("Change of Character (bearish reversal)")
-
-    if smc["liquidity_sweep"] == "bullish_sweep":
-        bull += 1.5
-        reasons.append("Liquidity sweep to the downside, reversed up")
-    elif smc["liquidity_sweep"] == "bearish_sweep":
-        bear += 1.5
-        reasons.append("Liquidity sweep to the upside, reversed down")
-
-    for gap in smc["fair_value_gaps"][-2:]:
-        if gap["type"] == "bullish_fvg":
-            bull += 0.5
-            reasons.append("Unfilled bullish Fair Value Gap nearby")
-        else:
-            bear += 0.5
-            reasons.append("Unfilled bearish Fair Value Gap nearby")
-
-    if smc["order_blocks"]:
-        last_ob = smc["order_blocks"][-1]
-        if last_ob["type"] == "bullish_ob":
-            bull += 1
-            reasons.append("Recent bullish order block")
-        else:
-            bear += 1
-            reasons.append("Recent bearish order block")
-
-    if smc["supply_demand"]["demand"]:
-        bull += 0.5
-        reasons.append("Price near demand zone")
-    if smc["supply_demand"]["supply"]:
-        bear += 0.5
-        reasons.append("Price near supply zone")
-
-    return round(bull), round(bear), reasons
-
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 def _pip_size(pair: str) -> float:
-    return 0.01 if pair in JPY_PAIRS else (0.1 if pair == "XAU/USD" else (1.0 if pair == "BTC/USD" else 0.0001))
+    """
+    Approximate pip/price step used only as a fallback when ATR is invalid.
+    """
+    if pair in JPY_PAIRS:
+        return 0.01
+
+    if pair == "XAU/USD":
+        return 0.1
+
+    if pair == "BTC/USD":
+        return 1.0
+
+    return 0.0001
 
 
-def generate_signal(pair: str, df: pd.DataFrame, is_news_blackout: bool = False) -> SignalResult:
+def _safe_float(value, default: float = 0.0) -> float:
+    """
+    Safely convert indicator values to float.
+    """
+    try:
+        value = float(value)
+
+        if pd.isna(value):
+            return default
+
+        return value
+    except (TypeError, ValueError):
+        return default
+
+
+def _empty_result(
+    pair: str,
+    explanation: str,
+    reject_reason: str,
+    confirmations: Optional[list[str]] = None,
+    confidence: int = 0,
+) -> SignalResult:
+    """
+    Consistent rejected/empty result.
+    """
+    return SignalResult(
+        pair=pair,
+        direction=None,
+        entry=0.0,
+        stop_loss=0.0,
+        take_profit_1=0.0,
+        take_profit_2=0.0,
+        risk_reward=0.0,
+        confidence=confidence,
+        explanation=explanation,
+        confirmations=confirmations or [],
+        published=False,
+        reject_reason=reject_reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Technical scoring
+# ---------------------------------------------------------------------------
+
+def _score_technical(
+    df: pd.DataFrame,
+) -> tuple[float, float, list[str], list[str]]:
+    """
+    Returns:
+
+        bullish_points,
+        bearish_points,
+        bullish_reasons,
+        bearish_reasons
+
+    Keeping bullish and bearish reasons separate is important.
+    A BUY explanation must not contain bearish confirmations.
+    """
+
+    bull = 0.0
+    bear = 0.0
+
+    bullish_reasons: list[str] = []
+    bearish_reasons: list[str] = []
+
+    last = df.iloc[-1]
+
+    # ------------------------------------------------------------------
+    # EMA trend
+    # ------------------------------------------------------------------
+
+    ema20 = _safe_float(last.get("ema_20"))
+    ema50 = _safe_float(last.get("ema_50"))
+    ema200 = _safe_float(last.get("ema_200"))
+
+    if ema20 > ema50 > ema200:
+        bull += 2.0
+        bullish_reasons.append("EMA stack bullish (20>50>200)")
+
+    elif ema20 < ema50 < ema200:
+        bear += 2.0
+        bearish_reasons.append("EMA stack bearish (20<50<200)")
+
+    # ------------------------------------------------------------------
+    # RSI
+    # ------------------------------------------------------------------
+
+    rsi = _safe_float(last.get("rsi_14"))
+
+    if rsi < 30:
+        bull += 1.0
+        bullish_reasons.append(f"RSI oversold ({rsi:.1f})")
+
+    elif rsi > 70:
+        bear += 1.0
+        bearish_reasons.append(f"RSI overbought ({rsi:.1f})")
+
+    elif rsi > 50:
+        bull += 0.5
+        bullish_reasons.append(f"RSI bullish bias ({rsi:.1f})")
+
+    elif rsi < 50:
+        bear += 0.5
+        bearish_reasons.append(f"RSI bearish bias ({rsi:.1f})")
+
+    # ------------------------------------------------------------------
+    # MACD
+    # ------------------------------------------------------------------
+
+    macd = _safe_float(last.get("macd"))
+    macd_signal = _safe_float(last.get("macd_signal"))
+    macd_hist = _safe_float(last.get("macd_hist"))
+
+    if macd > macd_signal and macd_hist > 0:
+        bull += 1.0
+        bullish_reasons.append("MACD bullish")
+
+    elif macd < macd_signal and macd_hist < 0:
+        bear += 1.0
+        bearish_reasons.append("MACD bearish")
+
+    # ------------------------------------------------------------------
+    # Bollinger Bands
+    # ------------------------------------------------------------------
+
+    close = _safe_float(last.get("close"))
+    bb_lower = _safe_float(last.get("bb_lower"))
+    bb_upper = _safe_float(last.get("bb_upper"))
+
+    if close <= bb_lower:
+        bull += 1.0
+        bullish_reasons.append("Price at/below lower Bollinger Band")
+
+    elif close >= bb_upper:
+        bear += 1.0
+        bearish_reasons.append("Price at/above upper Bollinger Band")
+
+    # ------------------------------------------------------------------
+    # ADX
+    # ------------------------------------------------------------------
+
+    adx = _safe_float(last.get("adx_14"))
+
+    if adx >= 25:
+        bullish_reasons.append(f"ADX strong trend ({adx:.1f})")
+        bearish_reasons.append(f"ADX strong trend ({adx:.1f})")
+
+    elif adx >= 20:
+        bullish_reasons.append(f"ADX moderate trend ({adx:.1f})")
+        bearish_reasons.append(f"ADX moderate trend ({adx:.1f})")
+
+    else:
+        bullish_reasons.append(f"ADX weak trend ({adx:.1f})")
+        bearish_reasons.append(f"ADX weak trend ({adx:.1f})")
+
+    return (
+        bull,
+        bear,
+        bullish_reasons,
+        bearish_reasons,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Candlestick pattern scoring
+# ---------------------------------------------------------------------------
+
+def _score_patterns(
+    df: pd.DataFrame,
+) -> tuple[float, float, list[str], list[str]]:
+    """
+    Score bullish and bearish candlestick patterns independently.
+    """
+
+    bull = 0.0
+    bear = 0.0
+
+    bullish_reasons: list[str] = []
+    bearish_reasons: list[str] = []
+
+    patterns = detect_patterns(df)
+
+    bullish_patterns = {
+        "bullish_engulfing",
+        "hammer",
+    }
+
+    bearish_patterns = {
+        "bearish_engulfing",
+        "shooting_star",
+    }
+
+    for pattern in patterns:
+
+        if pattern in bullish_patterns:
+            bull += 1.0
+            bullish_reasons.append(
+                f"Candlestick: {pattern.replace('_', ' ')}"
+            )
+
+        elif pattern in bearish_patterns:
+            bear += 1.0
+            bearish_reasons.append(
+                f"Candlestick: {pattern.replace('_', ' ')}"
+            )
+
+    return (
+        bull,
+        bear,
+        bullish_reasons,
+        bearish_reasons,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SMC scoring
+# ---------------------------------------------------------------------------
+
+def _score_smc(
+    df: pd.DataFrame,
+) -> tuple[float, float, list[str], list[str]]:
+    """
+    Score Smart Money Concepts independently for BUY and SELL.
+
+    The scoring is intentionally weighted:
+    - BOS = strong
+    - CHoCH = strong
+    - Liquidity sweep = medium/strong
+    - FVG = light
+    - Order block = medium
+    - Supply/demand = light
+    """
+
+    bull = 0.0
+    bear = 0.0
+
+    bullish_reasons: list[str] = []
+    bearish_reasons: list[str] = []
+
+    smc = full_smc_analysis(df)
+
+    # ------------------------------------------------------------------
+    # BOS
+    # ------------------------------------------------------------------
+
+    bos = smc.get("bos")
+
+    if bos == "bullish_bos":
+        bull += 2.0
+        bullish_reasons.append("Break of Structure (bullish)")
+
+    elif bos == "bearish_bos":
+        bear += 2.0
+        bearish_reasons.append("Break of Structure (bearish)")
+
+    # ------------------------------------------------------------------
+    # CHoCH
+    # ------------------------------------------------------------------
+
+    choch = smc.get("choch")
+
+    if choch == "bullish_choch":
+        bull += 2.0
+        bullish_reasons.append("Change of Character (bullish reversal)")
+
+    elif choch == "bearish_choch":
+        bear += 2.0
+        bearish_reasons.append("Change of Character (bearish reversal)")
+
+    # ------------------------------------------------------------------
+    # Liquidity sweep
+    # ------------------------------------------------------------------
+
+    liquidity_sweep = smc.get("liquidity_sweep")
+
+    if liquidity_sweep == "bullish_sweep":
+        bull += 1.5
+        bullish_reasons.append(
+            "Liquidity sweep to downside, then bullish rejection"
+        )
+
+    elif liquidity_sweep == "bearish_sweep":
+        bear += 1.5
+        bearish_reasons.append(
+            "Liquidity sweep to upside, then bearish rejection"
+        )
+
+    # ------------------------------------------------------------------
+    # Fair Value Gaps
+    # ------------------------------------------------------------------
+
+    fair_value_gaps = smc.get("fair_value_gaps") or []
+
+    for gap in fair_value_gaps[-2:]:
+
+        gap_type = gap.get("type")
+
+        if gap_type == "bullish_fvg":
+            bull += 0.5
+            bullish_reasons.append("Bullish Fair Value Gap")
+
+        elif gap_type == "bearish_fvg":
+            bear += 0.5
+            bearish_reasons.append("Bearish Fair Value Gap")
+
+    # ------------------------------------------------------------------
+    # Order blocks
+    # ------------------------------------------------------------------
+
+    order_blocks = smc.get("order_blocks") or []
+
+    if order_blocks:
+
+        latest_ob = order_blocks[-1]
+        ob_type = latest_ob.get("type")
+
+        if ob_type == "bullish_ob":
+            bull += 1.0
+            bullish_reasons.append("Recent bullish order block")
+
+        elif ob_type == "bearish_ob":
+            bear += 1.0
+            bearish_reasons.append("Recent bearish order block")
+
+    # ------------------------------------------------------------------
+    # Demand / supply
+    # ------------------------------------------------------------------
+
+    supply_demand = smc.get("supply_demand") or {}
+
+    demand = supply_demand.get("demand") or []
+    supply = supply_demand.get("supply") or []
+
+    if demand:
+        bull += 0.5
+        bullish_reasons.append("Demand zone detected")
+
+    if supply:
+        bear += 0.5
+        bearish_reasons.append("Supply zone detected")
+
+    return (
+        bull,
+        bear,
+        bullish_reasons,
+        bearish_reasons,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fibonacci confirmation
+# ---------------------------------------------------------------------------
+
+def _score_fibonacci(
+    df: pd.DataFrame,
+    direction: str,
+) -> tuple[float, list[str]]:
+    """
+    Fibonacci is used as a light confirmation rather than a major score.
+
+    We avoid making Fibonacci alone responsible for a trade.
+    """
+
+    try:
+        fib = fibonacci_levels(df)
+    except Exception:
+        return 0.0, []
+
+    if not fib:
+        return 0.0, []
+
+    last_price = _safe_float(df.iloc[-1]["close"])
+
+    levels: list[float] = []
+
+    if isinstance(fib, dict):
+        for value in fib.values():
+            try:
+                value = float(value)
+                if not pd.isna(value):
+                    levels.append(value)
+            except (TypeError, ValueError):
+                continue
+
+    elif isinstance(fib, (list, tuple)):
+        for value in fib:
+            try:
+                value = float(value)
+                if not pd.isna(value):
+                    levels.append(value)
+            except (TypeError, ValueError):
+                continue
+
+    if not levels:
+        return 0.0, []
+
+    # A Fibonacci level near current price acts as a small confirmation.
+    atr = _safe_float(df.iloc[-1].get("atr_14"))
+
+    if atr <= 0:
+        atr = _pip_size("")
+
+    proximity = atr * 0.5
+
+    nearby = any(abs(last_price - level) <= proximity for level in levels)
+
+    if not nearby:
+        return 0.0, []
+
+    if direction == "BUY":
+        return 0.5, ["Price near Fibonacci support/retracement level"]
+
+    return 0.5, ["Price near Fibonacci resistance/retracement level"]
+
+
+# ---------------------------------------------------------------------------
+# Direction selection
+# ---------------------------------------------------------------------------
+
+def _choose_direction(
+    total_bull: float,
+    total_bear: float,
+) -> Optional[str]:
+
+    if (
+        total_bull >= MIN_DIRECTION_SCORE
+        and total_bull > total_bear
+    ):
+        return "BUY"
+
+    if (
+        total_bear >= MIN_DIRECTION_SCORE
+        and total_bear > total_bull
+    ):
+        return "SELL"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Stop-loss / take-profit
+# ---------------------------------------------------------------------------
+
+def _build_trade_levels(
+    pair: str,
+    direction: str,
+    df: pd.DataFrame,
+) -> tuple[float, float, float, float, float]:
+    """
+    Returns:
+
+        entry,
+        stop_loss,
+        take_profit_1,
+        take_profit_2,
+        risk_reward
+    """
+
+    last = df.iloc[-1]
+
+    entry = _safe_float(last["close"])
+
+    atr = _safe_float(last.get("atr_14"))
+
+    if atr <= 0:
+        atr = _pip_size(pair) * 20
+
+    sl_distance = atr * ATR_SL_MULTIPLIER
+
+    sr = support_resistance(df)
+
+    support = sr.get("support") or []
+    resistance = sr.get("resistance") or []
+
+    # ---------------------------------------------------------------
+    # BUY
+    # ---------------------------------------------------------------
+
+    if direction == "BUY":
+
+        stop_loss = entry - sl_distance
+
+        valid_supports = [
+            _safe_float(level)
+            for level in support
+            if _safe_float(level) < entry
+        ]
+
+        if valid_supports:
+
+            nearest_support = max(valid_supports)
+
+            distance_to_support = entry - nearest_support
+
+            if distance_to_support <= sl_distance * 1.3:
+                structural_sl = (
+                    nearest_support
+                    - atr * STRUCTURE_PADDING_ATR
+                )
+
+                # Never allow structural SL to become invalid.
+                if structural_sl < entry:
+                    stop_loss = structural_sl
+
+        risk = entry - stop_loss
+
+        if risk <= 0:
+            stop_loss = entry - sl_distance
+            risk = entry - stop_loss
+
+        take_profit_1 = entry + risk * TP1_R_MULTIPLE
+        take_profit_2 = entry + risk * TP2_R_MULTIPLE
+
+    # ---------------------------------------------------------------
+    # SELL
+    # ---------------------------------------------------------------
+
+    else:
+
+        stop_loss = entry + sl_distance
+
+        valid_resistances = [
+            _safe_float(level)
+            for level in resistance
+            if _safe_float(level) > entry
+        ]
+
+        if valid_resistances:
+
+            nearest_resistance = min(valid_resistances)
+
+            distance_to_resistance = nearest_resistance - entry
+
+            if distance_to_resistance <= sl_distance * 1.3:
+                structural_sl = (
+                    nearest_resistance
+                    + atr * STRUCTURE_PADDING_ATR
+                )
+
+                # Never allow structural SL to become invalid.
+                if structural_sl > entry:
+                    stop_loss = structural_sl
+
+        risk = stop_loss - entry
+
+        if risk <= 0:
+            stop_loss = entry + sl_distance
+            risk = stop_loss - entry
+
+        take_profit_1 = entry - risk * TP1_R_MULTIPLE
+        take_profit_2 = entry - risk * TP2_R_MULTIPLE
+
+    risk_reward = (
+        abs(take_profit_1 - entry) / abs(entry - stop_loss)
+        if abs(entry - stop_loss) > 0
+        else 0.0
+    )
+
+    return (
+        entry,
+        stop_loss,
+        take_profit_1,
+        take_profit_2,
+        round(risk_reward, 2),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main signal generator
+# ---------------------------------------------------------------------------
+
+def generate_signal(
+    pair: str,
+    df: pd.DataFrame,
+    is_news_blackout: bool = False,
+) -> SignalResult:
+
+    # ------------------------------------------------------------------
+    # News blackout
+    # ------------------------------------------------------------------
+
     if is_news_blackout:
-        return SignalResult(
-            pair=pair, direction=None, entry=0, stop_loss=0, take_profit_1=0, take_profit_2=0,
-            risk_reward=0, confidence=0, explanation="Signal suppressed: major economic news window.",
+        return _empty_result(
+            pair=pair,
+            explanation=(
+                "Signal suppressed because the pair is inside "
+                "a major economic news blackout window."
+            ),
             reject_reason="news_blackout",
         )
 
-    if len(df) < 210:
-        return SignalResult(
-            pair=pair, direction=None, entry=0, stop_loss=0, take_profit_1=0, take_profit_2=0,
-            risk_reward=0, confidence=0, explanation="Insufficient historical data for analysis.",
+    # ------------------------------------------------------------------
+    # Data validation
+    # ------------------------------------------------------------------
+
+    if df is None or len(df) < MIN_BARS:
+        return _empty_result(
+            pair=pair,
+            explanation=(
+                f"Insufficient historical data. "
+                f"At least {MIN_BARS} candles are required."
+            ),
             reject_reason="insufficient_data",
         )
 
-    df = compute_all_indicators(df)
+    # ------------------------------------------------------------------
+    # Indicator calculation
+    # ------------------------------------------------------------------
+
+    try:
+        df = compute_all_indicators(df)
+    except Exception as exc:
+        return _empty_result(
+            pair=pair,
+            explanation=f"Indicator calculation failed: {exc}",
+            reject_reason="indicator_error",
+        )
+
+    if df.empty:
+        return _empty_result(
+            pair=pair,
+            explanation="Indicator calculation returned no data.",
+            reject_reason="indicator_error",
+        )
+
     last = df.iloc[-1]
 
-    tech_bull, tech_bear, tech_reasons = _score_technical(df)
-    pat_bull, pat_bear, pat_reasons = _score_patterns(df)
-    smc_bull, smc_bear, smc_reasons = _score_smc(df)
+    # ------------------------------------------------------------------
+    # Score each component
+    # ------------------------------------------------------------------
 
-    total_bull = tech_bull + pat_bull + smc_bull
-    total_bear = tech_bear + pat_bear + smc_bear
-    max_possible = 12.5  # rough ceiling of the weighted point system above, used to scale confidence
+    (
+        tech_bull,
+        tech_bear,
+        tech_bull_reasons,
+        tech_bear_reasons,
+    ) = _score_technical(df)
 
-    direction = None
-    if total_bull > total_bear and total_bull >= 5:
-        direction = "BUY"
-        score, reasons = total_bull, tech_reasons + pat_reasons + smc_reasons
-    elif total_bear > total_bull and total_bear >= 5:
-        direction = "SELL"
-        score, reasons = total_bear, tech_reasons + pat_reasons + smc_reasons
-    else:
-        return SignalResult(
-            pair=pair, direction=None, entry=0, stop_loss=0, take_profit_1=0, take_profit_2=0,
-            risk_reward=0, confidence=0,
-            explanation="No high-probability setup: confluence score too low or conflicting signals.",
-            confirmations=tech_reasons + pat_reasons + smc_reasons,
+    (
+        pat_bull,
+        pat_bear,
+        pat_bull_reasons,
+        pat_bear_reasons,
+    ) = _score_patterns(df)
+
+    (
+        smc_bull,
+        smc_bear,
+        smc_bull_reasons,
+        smc_bear_reasons,
+    ) = _score_smc(df)
+
+    total_bull = (
+        tech_bull
+        + pat_bull
+        + smc_bull
+    )
+
+    total_bear = (
+        tech_bear
+        + pat_bear
+        + smc_bear
+    )
+
+    # ------------------------------------------------------------------
+    # Direction
+    # ------------------------------------------------------------------
+
+    direction = _choose_direction(
+        total_bull,
+        total_bear,
+    )
+
+    all_confirmations = (
+        tech_bull_reasons
+        + tech_bear_reasons
+        + pat_bull_reasons
+        + pat_bear_reasons
+        + smc_bull_reasons
+        + smc_bear_reasons
+    )
+
+    if direction is None:
+
+        return _empty_result(
+            pair=pair,
+            explanation=(
+                "No high-confluence setup: "
+                f"BUY score={total_bull:.1f}, "
+                f"SELL score={total_bear:.1f}."
+            ),
+            confirmations=all_confirmations,
             reject_reason="low_confluence",
         )
 
-    confidence = min(97, max(30, round((score / max_possible) * 100)))
-
-    entry = float(last["close"])
-    atr_val = float(last["atr_14"]) if last["atr_14"] > 0 else _pip_size(pair) * 20
-    sr = support_resistance(df)
-    fib = fibonacci_levels(df)
-
-    # Stop loss: 1.5x ATR beyond entry, nudged to the nearest structural level if one is close.
-    sl_distance = atr_val * 1.5
+    # ------------------------------------------------------------------
+    # Direction-specific reasons
+    # ------------------------------------------------------------------
 
     if direction == "BUY":
-        stop_loss = entry - sl_distance
-        if sr["support"]:
-            nearest_support = max([s for s in sr["support"] if s < entry], default=None)
-            if nearest_support and (entry - nearest_support) < sl_distance * 1.3:
-                stop_loss = nearest_support - atr_val * 0.2
-        risk = entry - stop_loss
-        take_profit_1 = entry + risk * 2.0
-        take_profit_2 = entry + risk * 3.5
-    else:
-        stop_loss = entry + sl_distance
-        if sr["resistance"]:
-            nearest_resistance = min([r for r in sr["resistance"] if r > entry], default=None)
-            if nearest_resistance and (nearest_resistance - entry) < sl_distance * 1.3:
-                stop_loss = nearest_resistance + atr_val * 0.2
-        risk = stop_loss - entry
-        take_profit_1 = entry - risk * 2.0
-        take_profit_2 = entry - risk * 3.5
 
-    risk_reward = round(abs(take_profit_1 - entry) / abs(entry - stop_loss), 2) if abs(entry - stop_loss) > 0 else 0
+        score = total_bull
+
+        reasons = (
+            tech_bull_reasons
+            + pat_bull_reasons
+            + smc_bull_reasons
+        )
+
+    else:
+
+        score = total_bear
+
+        reasons = (
+            tech_bear_reasons
+            + pat_bear_reasons
+            + smc_bear_reasons
+        )
+
+    # ------------------------------------------------------------------
+    # Fibonacci confirmation
+    # ------------------------------------------------------------------
+
+    fib_points, fib_reasons = _score_fibonacci(
+        df,
+        direction,
+    )
+
+    score += fib_points
+    reasons += fib_reasons
+
+    # ------------------------------------------------------------------
+    # Calculate theoretical maximum
+    #
+    # Technical:
+    #   EMA = 2
+    #   RSI = 1
+    #   MACD = 1
+    #   BB = 1
+    #   TOTAL = 5
+    #
+    # Patterns:
+    #   Up to 2 recognised directional patterns = 2
+    #
+    # SMC:
+    #   BOS = 2
+    #   CHoCH = 2
+    #   Liquidity = 1.5
+    #   Two FVG = 1
+    #   OB = 1
+    #   Demand/Supply = 0.5
+    #   TOTAL = 8
+    #
+    # Fibonacci:
+    #   0.5
+    #
+    # Maximum = 15.5
+    # ------------------------------------------------------------------
+
+    max_possible = 15.5
+
+    confidence = round(
+        (score / max_possible) * 100
+    )
+
+    confidence = min(
+        MAX_CONFIDENCE,
+        max(
+            MIN_CONFIDENCE_FLOOR,
+            confidence,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Build trade levels
+    # ------------------------------------------------------------------
+
+    try:
+        (
+            entry,
+            stop_loss,
+            take_profit_1,
+            take_profit_2,
+            risk_reward,
+        ) = _build_trade_levels(
+            pair,
+            direction,
+            df,
+        )
+
+    except Exception as exc:
+
+        return SignalResult(
+            pair=pair,
+            direction=direction,
+            entry=0.0,
+            stop_loss=0.0,
+            take_profit_1=0.0,
+            take_profit_2=0.0,
+            risk_reward=0.0,
+            confidence=confidence,
+            explanation=f"Failed to build trade levels: {exc}",
+            confirmations=reasons,
+            published=False,
+            reject_reason="trade_level_error",
+        )
+
+    # ------------------------------------------------------------------
+    # Risk/reward validation
+    # ------------------------------------------------------------------
 
     if risk_reward < settings.MIN_RISK_REWARD_RATIO:
+
         return SignalResult(
-            pair=pair, direction=None, entry=entry, stop_loss=stop_loss,
-            take_profit_1=take_profit_1, take_profit_2=take_profit_2,
-            risk_reward=risk_reward, confidence=confidence,
-            explanation=f"Setup rejected: risk:reward {risk_reward} below minimum {settings.MIN_RISK_REWARD_RATIO}.",
-            confirmations=reasons, reject_reason="rr_too_low",
+            pair=pair,
+            direction=None,
+            entry=entry,
+            stop_loss=stop_loss,
+            take_profit_1=take_profit_1,
+            take_profit_2=take_profit_2,
+            risk_reward=risk_reward,
+            confidence=confidence,
+            explanation=(
+                f"Setup rejected: risk:reward "
+                f"{risk_reward}:1 is below the minimum "
+                f"{settings.MIN_RISK_REWARD_RATIO}:1."
+            ),
+            confirmations=reasons,
+            published=False,
+            reject_reason="rr_too_low",
         )
+
+    # ------------------------------------------------------------------
+    # Confidence validation
+    # ------------------------------------------------------------------
 
     if confidence < settings.MIN_CONFIDENCE_TO_PUBLISH:
+
         return SignalResult(
-            pair=pair, direction=direction, entry=entry, stop_loss=stop_loss,
-            take_profit_1=take_profit_1, take_profit_2=take_profit_2,
-            risk_reward=risk_reward, confidence=confidence,
-            explanation=f"Setup rejected: confidence {confidence}% below publish threshold "
-                        f"{settings.MIN_CONFIDENCE_TO_PUBLISH}%.",
-            confirmations=reasons, reject_reason="low_confidence",
+            pair=pair,
+            direction=direction,
+            entry=entry,
+            stop_loss=stop_loss,
+            take_profit_1=take_profit_1,
+            take_profit_2=take_profit_2,
+            risk_reward=risk_reward,
+            confidence=confidence,
+            explanation=(
+                f"Setup rejected: confidence {confidence}% "
+                f"is below publish threshold "
+                f"{settings.MIN_CONFIDENCE_TO_PUBLISH}%."
+            ),
+            confirmations=reasons,
+            published=False,
+            reject_reason="low_confidence",
         )
 
+    # ------------------------------------------------------------------
+    # Final explanation
+    # ------------------------------------------------------------------
+
+    shown_reasons = reasons[:5]
+
     explanation = (
-        f"{direction} {pair}: {len(reasons)} confluences aligned "
-        f"({', '.join(reasons[:4])}{'...' if len(reasons) > 4 else ''}). "
-        f"Entry near current price with stop beyond recent structure/ATR, "
-        f"targeting a {risk_reward}:1 reward-to-risk."
+        f"{direction} {pair}: "
+        f"{len(reasons)} directional confluences aligned "
+        f"(score {score:.1f}/{max_possible:.1f}). "
+        f"{', '.join(shown_reasons)}"
+        f"{'...' if len(reasons) > 5 else ''}. "
+        f"Entry based on current price, with ATR/structure-based stop "
+        f"and TP1/TP2 at approximately "
+        f"{TP1_R_MULTIPLE}R/{TP2_R_MULTIPLE}R."
     )
+
+    # ------------------------------------------------------------------
+    # Published signal
+    # ------------------------------------------------------------------
 
     return SignalResult(
         pair=pair,
@@ -273,4 +982,5 @@ def generate_signal(pair: str, df: pd.DataFrame, is_news_blackout: bool = False)
         explanation=explanation,
         confirmations=reasons,
         published=True,
+        reject_reason=None,
     )
